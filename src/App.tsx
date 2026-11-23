@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { supabase } from "./lib/supabase";
  
 const PALETTE = [
   { name: "Peony", color: "#F2CFC9" },
@@ -298,6 +299,13 @@ const parseIcsCalendar = (raw: string): ImportedCalendarEvent[] => {
 };
 
 export default function App() {
+  const [session, setSession] = useState<any>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [cloudReady, setCloudReady] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
   const [page, setPage] = useState<"Planner" | "Projects" | "Settings">("Planner");
   const [feedPreferences, setFeedPreferences] = useState<FeedPreferences>(() => {
     const defaults = {
@@ -420,6 +428,115 @@ export default function App() {
     newDate: string;
   } | null>(null);
  
+  // Restore the Supabase session and listen for sign-in/sign-out changes.
+  useEffect(() => {
+    let alive = true;
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!alive) return;
+      if (error) setAuthError(error.message);
+      setSession(data.session);
+      setAuthLoading(false);
+    }).catch((error) => {
+      if (!alive) return;
+      setAuthError(error?.message || "Could not check your session.");
+      setAuthLoading(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+      setCloudReady(false);
+      setAuthError("");
+    });
+    return () => { alive = false; listener.subscription.unsubscribe(); };
+  }, []);
+
+  const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: authEmail.trim(),
+        password: authPassword,
+      });
+      if (error) setAuthError(error.message);
+    } catch (error: any) {
+      setAuthError(error?.message || "Login failed. Please try again.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    setCloudReady(false);
+    const { error } = await supabase.auth.signOut();
+    if (error) setAuthError(error.message);
+  };
+
+  // Load the signed-in user's cloud state once. If no cloud record exists yet,
+  // migrate the current browser's local data without overwriting existing cloud data.
+  useEffect(() => {
+    let cancelled = false;
+    const loadCloudState = async () => {
+      if (!session?.user?.id) { setCloudReady(false); return; }
+      setCloudReady(false);
+      setAuthError("");
+      try {
+        const userId = session.user.id;
+        const { data, error } = await supabase
+          .from("user_app_state")
+          .select("state")
+          .eq("user_id", userId)
+          .maybeSingle();
+        if (error) throw error;
+        if (cancelled) return;
+        if (data?.state && typeof data.state === "object") {
+          const state = data.state as any;
+          if (Array.isArray(state.tasks)) setTasks(state.tasks);
+          if (Array.isArray(state.projects)) setProjects(state.projects);
+          if (Array.isArray(state.unassignedColumns) && state.unassignedColumns.length) setUnassignedColumns(state.unassignedColumns);
+          if (["7", "3", "1"].includes(state.plannerView)) setPlannerView(state.plannerView);
+          if (typeof state.importantBlockVisible === "boolean") setImportantBlockVisible(state.importantBlockVisible);
+          if (state.feedPreferences && typeof state.feedPreferences === "object") setFeedPreferences(state.feedPreferences);
+        } else {
+          const initialState = {
+            tasks: JSON.parse(localStorage.getItem("dromhjem-tasks-v7") || "[]"),
+            projects: JSON.parse(localStorage.getItem("dromhjem-projects-v7") || "[]"),
+            unassignedColumns: JSON.parse(localStorage.getItem("dromhjem-unassigned-columns-v1") || "[]"),
+            plannerView: localStorage.getItem("dromhjem-planner-view-v1") || "7",
+            importantBlockVisible: localStorage.getItem("dromhjem-important-block-visible-v1") !== "false",
+            feedPreferences: JSON.parse(localStorage.getItem("dromhjem-feed-preferences-v1") || "{}"),
+          };
+          const { error: saveError } = await supabase.from("user_app_state").upsert({
+            user_id: userId, state: initialState, updated_at: new Date().toISOString(),
+          }, { onConflict: "user_id" });
+          if (saveError) throw saveError;
+        }
+        if (!cancelled) setCloudReady(true);
+      } catch (error: any) {
+        if (!cancelled) {
+          setAuthError(`Cloud sync could not be loaded: ${error?.message || "Unknown error"}`);
+          // Keep the local planner usable even if the network is temporarily unavailable.
+          setCloudReady(true);
+        }
+      }
+    };
+    loadCloudState();
+    return () => { cancelled = true; };
+  }, [session?.user?.id]);
+
+  // Keep local storage as an offline cache and debounce cloud writes after hydration.
+  useEffect(() => {
+    if (!session?.user?.id || !cloudReady) return;
+    const state = { tasks, projects, unassignedColumns, plannerView, importantBlockVisible, feedPreferences };
+    const timer = window.setTimeout(async () => {
+      const { error } = await supabase.from("user_app_state").upsert({
+        user_id: session.user.id, state, updated_at: new Date().toISOString(),
+      }, { onConflict: "user_id" });
+      if (error) setAuthError(`Cloud save failed: ${error.message}`);
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [session?.user?.id, cloudReady, tasks, projects, unassignedColumns, plannerView, importantBlockVisible, feedPreferences]);
+
   useEffect(() => {
     localStorage.setItem("dromhjem-tasks-v7", JSON.stringify(tasks));
   }, [tasks]);
@@ -1469,6 +1586,31 @@ export default function App() {
           </section>}
   </>);
 
+  /* Authentication gate: keep the complete planner mounted only for signed-in users. */
+  if (authLoading) {
+    return <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#FCFCED", color: "#20231F", fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" }}>Loading drømhjem…</div>;
+  }
+
+  if (!session) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#FCFCED", display: "grid", placeItems: "center", padding: 24, color: "#20231F", fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" }}>
+        <form onSubmit={handleLogin} style={{ width: "100%", maxWidth: 380, background: "#FFF", border: "1px solid #E8E8DD", borderRadius: 22, padding: 30, boxShadow: "0 12px 40px rgba(40,40,20,.06)" }}>
+          <div style={{ textAlign: "center", marginBottom: 28 }}>
+            <div style={{ fontSize: 28, letterSpacing: "-.06em", fontWeight: 600 }}>drømhjem</div>
+            <div style={{ marginTop: 8, color: "#77796F", fontSize: 13 }}>Less planning. More doing.</div>
+          </div>
+          <label style={{ display: "block", fontSize: 12, marginBottom: 7 }}>E-Mail</label>
+          <input type="email" required autoComplete="username" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" style={{ width: "100%", padding: "13px 14px", border: "1px solid #E3E3D9", borderRadius: 11, marginBottom: 17, background: "#FCFCED", color: "#20231F", outlineColor: "#A9B7A1" }} />
+          <label style={{ display: "block", fontSize: 12, marginBottom: 7 }}>Passwort</label>
+          <input type="password" required autoComplete="current-password" value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="Passwort" style={{ width: "100%", padding: "13px 14px", border: "1px solid #E3E3D9", borderRadius: 11, marginBottom: 18, background: "#FCFCED", color: "#20231F", outlineColor: "#A9B7A1" }} />
+          {authError && <div role="alert" style={{ color: "#A13E35", fontSize: 12, lineHeight: 1.5, marginBottom: 14 }}>{authError}</div>}
+          <button type="submit" disabled={authBusy} style={{ width: "100%", padding: 14, border: 0, borderRadius: 999, background: "#20231F", color: "#FFF", cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .65 : 1 }}>{authBusy ? "Anmeldung…" : "Anmelden"}</button>
+          <p style={{ textAlign: "center", color: "#85867C", fontSize: 11, margin: "18px 0 0" }}>Private Beta · Zugang nur mit Einladung</p>
+        </form>
+      </div>
+    );
+  }
+
   /* STYLES */
  
   return (
@@ -2130,150 +2272,6 @@ export default function App() {
           .project-detail-header { flex-direction: column; }
           .unassigned-board { grid-template-columns: 1fr; }
         }
-
-        /* Responsive layout layer — desktop, tablet and mobile */
-        .app { width: 100%; min-width: 0; overflow-x: clip; }
-        .page, .topbar, .settings-page { min-width: 0; width: 100%; }
-        .task-card, .project-card, .day-card, .unassigned-column,
-        .important-task, .settings-group, .project-detail { min-width: 0; }
-        .task-title, .project-name, .project-description,
-        .important-task-name, .milestone-title { overflow-wrap: anywhere; }
-
-        @media (min-width: 651px) and (max-width: 1100px) {
-          .app { padding: 24px 28px 52px; }
-          .topbar { margin-bottom: 38px; }
-          .week-toolbar { align-items: flex-start; flex-direction: column; }
-          .week-progress { justify-content: flex-start; }
-          .week-progress-copy { text-align: left; }
-          .week-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 11px; }
-          .week-grid.view-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-          .week-grid.view-1 { grid-template-columns: minmax(0, 1fr); }
-          .day-card { min-height: 340px; padding: 16px 12px 12px; }
-          .projects-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-          .project-detail { padding: 20px; }
-          .settings-group { padding: 22px; }
-        }
-
-        @media (max-width: 650px) {
-          .app {
-            padding: max(14px, env(safe-area-inset-top)) 14px
-              max(28px, env(safe-area-inset-bottom)) !important;
-            font-size: 14px;
-          }
-          .topbar {
-            align-items: center; gap: 12px; margin-bottom: 25px;
-          }
-          .brand { width: 42px; height: 42px; }
-          .brand img { width: 42px; height: 42px; }
-          .nav-wrap { margin-left: auto; min-width: 0; }
-          .nav {
-            max-width: calc(100vw - 82px); gap: 1px; padding: 3px;
-          }
-          .nav button { padding: 9px 10px !important; font-size: 11px !important; }
-          .nav .nav-search-btn { width: 32px; min-width: 32px; height: 32px; }
-          .page-heading { align-items: flex-start; gap: 12px; margin-bottom: 22px; }
-          .page-heading h1, h1 { font-size: clamp(23px, 7vw, 29px); }
-          .page-heading > button, .page-heading .primary-btn {
-            flex: 0 0 auto; max-width: 48%; white-space: normal;
-          }
-
-          /* Planner controls wrap cleanly instead of squeezing */
-          .week-toolbar { gap: 14px; margin-bottom: 15px; }
-          .week-controls { width: 100%; display: flex; flex-wrap: wrap; gap: 8px; }
-          .week-label { flex: 1 1 110px; min-width: 0; font-size: 12px; }
-          .week-controls .icon-btn { width: 36px; height: 36px; flex: 0 0 36px; }
-          .today-btn { padding: 8px 5px; }
-          .view-switch { margin-left: auto; }
-          .view-switch button { padding: 8px 10px; font-size: 10px; }
-          .week-progress { min-width: 0; width: 100%; justify-content: flex-start; }
-          .week-progress-circle { width: 38px; height: 38px; }
-
-          /* A single readable day column prevents cramped task cards */
-          .week-grid,
-          .week-grid.view-3,
-          .week-grid.view-1 {
-            grid-template-columns: minmax(0, 1fr) !important;
-            gap: 11px;
-          }
-          .day-card { min-height: 0; padding: 14px 13px 13px; border-radius: 16px; }
-          .day-top { padding-bottom: 10px; }
-          .day-number { font-size: 22px; }
-          .day-add { padding: 9px 2px 10px; margin-bottom: 9px; }
-          .day-tasks { min-height: 0; gap: 7px; }
-          .task-card { width: 100%; padding: 12px 11px; gap: 10px; border-radius: 11px; }
-          .task-check { width: 19px; height: 19px; flex-basis: 19px; margin-top: 1px; }
-          .task-title { font-size: 13px; line-height: 1.45; }
-          .task-meta { font-size: 10px; line-height: 1.4; }
-          .task-mobile-edit { font-size: 11px; padding-top: 6px; }
-          .task-edit { display: none !important; }
-
-          /* Dashboard, unassigned and reminders */
-          .dashboard-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-          .dashboard-card { min-height: 74px; padding: 10px 8px; }
-          .dashboard-card strong { font-size: 21px; }
-          .unassigned-board { grid-template-columns: minmax(0, 1fr); gap: 10px; }
-          .unassigned-column { padding: 13px; min-height: 0; }
-          .unscheduled { min-height: 0; padding: 10px; }
-          .unscheduled .task-card { width: 100%; }
-          .important-task-list { grid-template-columns: minmax(0, 1fr); }
-          .important-task { align-items: flex-start; }
-          .important-task-date { max-width: 92px; white-space: normal; }
-
-          /* Projects and project details */
-          .projects-grid, .project-task-list { grid-template-columns: minmax(0, 1fr); }
-          .project-card { min-height: 0; padding: 18px; }
-          .project-name { margin-top: 13px; font-size: 19px; }
-          .project-detail { padding: 16px; margin-top: 16px; }
-          .project-detail-header { gap: 12px; margin-bottom: 18px; }
-          .project-detail-header h2 { font-size: 22px; overflow-wrap: anywhere; }
-          .project-detail-actions { width: 100%; flex-wrap: wrap; }
-          .detail-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-          .detail-stat { padding: 12px; }
-          .detail-stat strong { font-size: 20px; }
-          .project-completed-task { padding: 12px; gap: 8px; }
-          .project-completed-task-name { white-space: normal; overflow-wrap: anywhere; }
-          .project-add { flex-wrap: wrap; }
-          .project-add input { min-width: 0; }
-
-          /* Settings and forms */
-          .settings-page { width: 100%; }
-          .settings-group { padding: 17px 14px !important; margin: 13px 0 !important; }
-          .settings-row { align-items: flex-start; gap: 10px; font-size: 12px; }
-          .settings-row > span { min-width: 0; overflow-wrap: anywhere; }
-          .backup-tools { padding: 14px; }
-          .backup-actions { display: grid; grid-template-columns: 1fr; width: 100%; }
-          .backup-actions > * { width: 100%; }
-          .modal-backdrop { align-items: flex-end; padding: 0 !important; }
-          .modal, .confirm-modal {
-            width: 100% !important; max-width: none !important;
-            max-height: min(90dvh, 820px); overflow-y: auto;
-            border-radius: 20px 20px 0 0 !important;
-            padding: 22px 17px max(20px, env(safe-area-inset-bottom)) !important;
-          }
-          .modal-footer { flex-wrap: wrap; gap: 12px; }
-          .modal-footer-right { width: 100%; display: flex; gap: 8px; }
-          .modal-footer-right > button { flex: 1; min-width: 0; }
-          .milestone-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-          .milestone-form input, .milestone-form button { min-width: 0; }
-          .global-search-wrap { width: min(320px, calc(100vw - 28px)); }
-          .search-results { max-height: 55dvh; }
-        }
-
-        @media (max-width: 390px) {
-          .app { padding-left: 11px !important; padding-right: 11px !important; }
-          .nav button { padding: 8px 8px !important; font-size: 10px !important; }
-          .nav .nav-search-btn { width: 29px; min-width: 29px; height: 29px; }
-          .week-controls { gap: 6px; }
-          .view-switch button { padding: 7px 8px; }
-          .dashboard-card { min-height: 68px; }
-          .section-heading h2 { font-size: 18px; }
-        }
-
-        @media (hover: none) {
-          .task-card:hover, .project-card:hover { transform: none; box-shadow: none; }
-          .task-edit { display: none; }
-        }
-
       `}</style>
  
       <header className="topbar">
@@ -2284,6 +2282,7 @@ export default function App() {
             <button className={page === "Projects" ? "active" : ""} onClick={() => setPage("Projects")}>Projects</button>
             <button className={page === "Settings" ? "active" : ""} onClick={() => setPage("Settings")}>Settings</button>
             <button className={`nav-search-btn ${searchOpen ? "active" : ""}`} onClick={() => { setSearchOpen((open) => !open); setSearchQuery(""); }} aria-label="Search" title="Search"><Icon name="search" size={17} /></button>
+            <button className="nav-search-btn" onClick={handleLogout} title="Sign out" aria-label="Sign out">↪</button>
           </nav>
           {searchOpen && <div className="global-search-wrap">
             <input autoFocus className="global-search" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search..." aria-label="Search tasks and projects" />
