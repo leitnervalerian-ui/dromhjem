@@ -306,6 +306,13 @@ export default function App() {
   const [authPassword, setAuthPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
+  // Supabase invitation links return to this app with type=invite in the URL hash.
+  const [inviteMode, setInviteMode] = useState(() => {
+    const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    const query = new URLSearchParams(window.location.search);
+    return hash.get("type") === "invite" || query.get("type") === "invite";
+  });
+  const [authPasswordConfirm, setAuthPasswordConfirm] = useState("");
   const [page, setPage] = useState<"Planner" | "Projects" | "Settings">("Planner");
   const [feedPreferences, setFeedPreferences] = useState<FeedPreferences>(() => {
     const defaults = {
@@ -441,7 +448,14 @@ export default function App() {
       setAuthError(error?.message || "Could not check your session.");
       setAuthLoading(false);
     });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+    const { data: listener } = supabase.auth.onAuthStateChange((event, nextSession) => {
+      // Keep the invitation screen active while Supabase exchanges the invite link
+      // for a session. PASSWORD_RECOVERY is also handled for password setup links.
+      const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+      const query = new URLSearchParams(window.location.search);
+      if (hash.get("type") === "invite" || query.get("type") === "invite" || event === "PASSWORD_RECOVERY") {
+        setInviteMode(true);
+      }
       setSession(nextSession);
       setCloudReady(false);
       setAuthError("");
@@ -461,6 +475,33 @@ export default function App() {
       if (error) setAuthError(error.message);
     } catch (error: any) {
       setAuthError(error?.message || "Login failed. Please try again.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleSetPassword = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAuthError("");
+    if (authPassword.length < 8) {
+      setAuthError("Das Passwort muss mindestens 8 Zeichen haben.");
+      return;
+    }
+    if (authPassword !== authPasswordConfirm) {
+      setAuthError("Die Passwörter stimmen nicht überein.");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      const { error } = await supabase.auth.updateUser({ password: authPassword });
+      if (error) throw error;
+      setInviteMode(false);
+      setAuthPassword("");
+      setAuthPasswordConfirm("");
+      // Remove the one-time invite tokens from the address bar without signing out.
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } catch (error: any) {
+      setAuthError(error?.message || "Das Passwort konnte nicht gespeichert werden.");
     } finally {
       setAuthBusy(false);
     }
@@ -1589,6 +1630,25 @@ export default function App() {
   /* Authentication gate: keep the complete planner mounted only for signed-in users. */
   if (authLoading) {
     return <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#FCFCED", color: "#20231F", fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" }}>Loading drømhjem…</div>;
+  }
+
+  if (session && inviteMode) {
+    return (
+      <div style={{ minHeight: "100vh", width: "100%", background: "#FCFCED", display: "grid", placeItems: "center", padding: 24, color: "#20231F", fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" }}>
+        <form onSubmit={handleSetPassword} style={{ width: "100%", maxWidth: 400, background: "#FFF", border: "1px solid #E8E8DD", borderRadius: 22, padding: 30, boxShadow: "0 12px 40px rgba(40,40,20,.06)" }}>
+          <div style={{ textAlign: "center", marginBottom: 28 }}>
+            <div style={{ fontSize: 28, letterSpacing: "-.06em", fontWeight: 600 }}>drømhjem</div>
+            <div style={{ marginTop: 8, color: "#77796F", fontSize: 13 }}>Willkommen – richte deinen Zugang ein.</div>
+          </div>
+          <label style={{ display: "block", fontSize: 12, marginBottom: 7 }}>Neues Passwort</label>
+          <input type="password" required minLength={8} autoComplete="new-password" value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="Mindestens 8 Zeichen" style={{ width: "100%", padding: "13px 14px", border: "1px solid #E3E3D9", borderRadius: 11, marginBottom: 17, background: "#FCFCED", color: "#20231F", outlineColor: "#A9B7A1" }} />
+          <label style={{ display: "block", fontSize: 12, marginBottom: 7 }}>Passwort wiederholen</label>
+          <input type="password" required minLength={8} autoComplete="new-password" value={authPasswordConfirm} onChange={(event) => setAuthPasswordConfirm(event.target.value)} placeholder="Passwort erneut eingeben" style={{ width: "100%", padding: "13px 14px", border: "1px solid #E3E3D9", borderRadius: 11, marginBottom: 18, background: "#FCFCED", color: "#20231F", outlineColor: "#A9B7A1" }} />
+          {authError && <div role="alert" style={{ color: "#A13E35", fontSize: 12, lineHeight: 1.5, marginBottom: 14 }}>{authError}</div>}
+          <button type="submit" disabled={authBusy} style={{ width: "100%", padding: 14, border: 0, borderRadius: 999, background: "#20231F", color: "#FFF", cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .65 : 1 }}>{authBusy ? "Passwort wird gespeichert…" : "Passwort festlegen"}</button>
+        </form>
+      </div>
+    );
   }
 
   if (!session) {
