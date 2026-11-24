@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./lib/supabase";
  
 const PALETTE = [
@@ -428,6 +428,14 @@ export default function App() {
   const [backupMessage, setBackupMessage] = useState("");
 
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
+  const taskPointerRef = useRef<{
+    taskId: string;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    dragging: boolean;
+    suppressClick: boolean;
+  } | null>(null);
   const [draggedLayoutItem, setDraggedLayoutItem] = useState<{ list: "sections" | "overview"; label: string } | null>(null);
  
   const [pendingMove, setPendingMove] = useState<{
@@ -566,16 +574,54 @@ export default function App() {
   }, [session?.user?.id]);
 
   // Keep local storage as an offline cache and debounce cloud writes after hydration.
+  // Use an explicit select after upsert so failures are surfaced and the write is verified.
   useEffect(() => {
-    if (!session?.user?.id || !cloudReady) return;
-    const state = { tasks, projects, unassignedColumns, plannerView, importantBlockVisible, feedPreferences };
+    const userId = session?.user?.id;
+    if (!userId || !cloudReady) return;
+
+    let cancelled = false;
+    const state = {
+      tasks,
+      projects,
+      unassignedColumns,
+      plannerView,
+      importantBlockVisible,
+      feedPreferences,
+    };
+
     const timer = window.setTimeout(async () => {
-      const { error } = await supabase.from("user_app_state").upsert({
-        user_id: session.user.id, state, updated_at: new Date().toISOString(),
-      }, { onConflict: "user_id" });
-      if (error) setAuthError(`Cloud save failed: ${error.message}`);
+      try {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        if (sessionData.session?.user?.id !== userId) return;
+
+        const { data, error } = await supabase
+          .from("user_app_state")
+          .upsert(
+            { user_id: userId, state, updated_at: new Date().toISOString() },
+            { onConflict: "user_id" }
+          )
+          .select("user_id, state, updated_at")
+          .single();
+
+        if (error) throw error;
+        if (!cancelled && (!data || data.user_id !== userId || !data.state)) {
+          throw new Error("Supabase hat den Speicherstand nicht bestätigt.");
+        }
+        if (!cancelled) setAuthError("");
+      } catch (error: any) {
+        if (!cancelled) {
+          const message = error?.message || "Unbekannter Fehler beim Speichern.";
+          setAuthError(`Cloud save failed: ${message}`);
+          console.error("drømhjem cloud save failed:", error);
+        }
+      }
     }, 700);
-    return () => window.clearTimeout(timer);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [session?.user?.id, cloudReady, tasks, projects, unassignedColumns, plannerView, importantBlockVisible, feedPreferences]);
 
   useEffect(() => {
@@ -1364,20 +1410,179 @@ export default function App() {
     );
   }
  
-  /* TASK CARD */
+  const reorderTaskByDrop = (draggedId: string, targetTaskId?: string, targetDate?: string, insertAfter = false) => {
+    if (!draggedId || draggedId === targetTaskId) {
+      setDraggedTaskId(null);
+      return;
+    }
+
+    setTasks((current) => {
+      const dragged = current.find((item) => item.id === draggedId);
+      if (!dragged) return current;
+
+      const target = targetTaskId ? current.find((item) => item.id === targetTaskId) : undefined;
+      const destinationDate = targetDate ?? target?.date ?? dragged.date ?? "";
+      const moved = {
+        ...dragged,
+        date: destinationDate,
+        ...(destinationDate ? {} : { unassignedColumnId: dragged.unassignedColumnId || DEFAULT_UNASSIGNED_COLUMN_ID }),
+      };
+
+      // Rebuild the ordered list for the destination day, then put those task
+      // objects back into the exact slots occupied by that day's tasks.
+      const withoutDragged = current.filter((item) => item.id !== draggedId);
+      const dayItems = withoutDragged.filter((item) => item.date === destinationDate);
+      if (targetTaskId) {
+        const targetIndex = dayItems.findIndex((item) => item.id === targetTaskId);
+        if (targetIndex >= 0) {
+          dayItems.splice(targetIndex + (insertAfter ? 1 : 0), 0, moved);
+        } else {
+          dayItems.push(moved);
+        }
+      } else {
+        dayItems.push(moved);
+      }
+
+      const result: Task[] = [];
+      let nextDayIndex = 0;
+      let inserted = false;
+
+      for (const item of withoutDragged) {
+        if (item.date === destinationDate) {
+          result.push(dayItems[nextDayIndex++]);
+          inserted = true;
+        } else {
+          result.push(item);
+        }
+      }
+
+      if (!inserted) result.push(...dayItems);
+      else if (nextDayIndex < dayItems.length) result.push(...dayItems.slice(nextDayIndex));
+
+      return result;
+    });
+
+    setDraggedTaskId(null);
+  };
+
+  // Keep pointer movement outside React rendering. Updating component state
+  // on every pointermove caused visible lag; we now calculate the drop target
+  // only once, on pointerup.
+  useEffect(() => {
+    const handlePointerMove = (event: PointerEvent) => {
+      const pointer = taskPointerRef.current;
+      if (!pointer || pointer.pointerId !== event.pointerId || pointer.dragging) return;
+
+      const distance = Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY);
+      if (distance > 7) {
+        pointer.dragging = true;
+        pointer.suppressClick = true;
+        setDraggedTaskId(pointer.taskId);
+      }
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      const pointer = taskPointerRef.current;
+      if (!pointer || pointer.pointerId !== event.pointerId) return;
+
+      if (pointer.dragging) {
+        const hit = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
+        const targetDay = hit?.closest<HTMLElement>("[data-day-key]");
+
+        if (targetDay?.dataset.dayKey) {
+          const destinationDate = targetDay.dataset.dayKey;
+          // Resolve the insertion point from every card in the destination
+          // column, not just the element directly under the pointer. This is
+          // important when dragging upward: the dragged card itself can cover
+          // the drop target and otherwise make the task fall to the bottom.
+          const cards = Array.from(
+            targetDay.querySelectorAll<HTMLElement>("[data-task-id]")
+          ).filter((card) => card.dataset.taskId !== pointer.taskId);
+
+          let targetTask: HTMLElement | undefined;
+          let insertAfter = false;
+
+          for (const card of cards) {
+            const rect = card.getBoundingClientRect();
+            const midpoint = rect.top + rect.height / 2;
+            if (event.clientY < midpoint) {
+              targetTask = card;
+              insertAfter = false;
+              break;
+            }
+            targetTask = card;
+            insertAfter = true;
+          }
+
+          reorderTaskByDrop(
+            pointer.taskId,
+            targetTask?.dataset.taskId,
+            destinationDate,
+            insertAfter
+          );
+        } else {
+          setDraggedTaskId(null);
+        }
+
+        // Keep this until the synthetic click is suppressed by the card.
+        taskPointerRef.current = { ...pointer, dragging: false };
+      } else {
+        taskPointerRef.current = null;
+      }
+    };
+
+    const handlePointerCancel = (event: PointerEvent) => {
+      const pointer = taskPointerRef.current;
+      if (!pointer || pointer.pointerId !== event.pointerId) return;
+      taskPointerRef.current = null;
+      setDraggedTaskId(null);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: true });
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerCancel);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+    };
+  }, []);
+
+    /* TASK CARD */
  
   const renderTask = (task: Task, compact = false) => (
     <div
       key={task.id}
-      className={`task-card ${compact ? "task-card-compact" : ""} ${task.done ? "task-done" : ""}`}
+      className={`task-card ${compact ? "task-card-compact" : ""} ${task.done ? "task-done" : ""} ${draggedTaskId === task.id ? "task-is-dragging" : ""}`}
       style={{ background: task.color || DEFAULT_COLOR }}
-      draggable
-      onDragStart={() => setDraggedTaskId(task.id)}
-      onDragEnd={() => setDraggedTaskId(null)}
-      onClick={() => openEditTask(task)}
+      data-task-id={task.id}
+      data-task-date={task.date}
+      onPointerDown={(event) => {
+        if (event.button !== 0 && event.pointerType === "mouse") return;
+        // Prevent browser text selection/callout while the card is being grabbed.
+        if (event.pointerType === "touch") event.preventDefault();
+        // The checkbox keeps its own click behavior; dragging starts anywhere
+        // else on the task card.
+        taskPointerRef.current = {
+          taskId: task.id,
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          dragging: false,
+          suppressClick: false,
+        };
+      }}
+      onClick={() => {
+        if (taskPointerRef.current?.suppressClick) {
+          taskPointerRef.current = null;
+          return;
+        }
+        openEditTask(task);
+      }}
     >
       <button
         className={`task-check ${task.done ? "checked" : ""}`}
+        onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => {
           event.stopPropagation();
           toggleTask(task.id);
@@ -1388,7 +1593,6 @@ export default function App() {
  
       <div className="task-content">
         <div className="task-title">{task.title}</div>
-        <button className="task-mobile-edit" onClick={(event) => { event.stopPropagation(); openEditTask(task); }}>Edit / reschedule</button>
         {!compact && (
           <div className="task-meta">
             {task.projectId && (
@@ -1399,7 +1603,6 @@ export default function App() {
           </div>
         )}
       </div>
-      <span className="task-edit"><Icon name="pencil" size={13} /></span>
     </div>
   );
  
@@ -1464,15 +1667,14 @@ export default function App() {
                 <section
                   key={key}
                   className={`day-card ${key === today ? "is-today" : ""}`}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    event.currentTarget.classList.add("drag-over");
-                  }}
+                  data-day-key={key}
+                  onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; event.currentTarget.classList.add("drag-over"); }}
                   onDragLeave={(event) => event.currentTarget.classList.remove("drag-over")}
                   onDrop={(event) => {
                     event.preventDefault();
                     event.currentTarget.classList.remove("drag-over");
-                    if (draggedTaskId) moveTask(draggedTaskId, key);
+                    const draggedId = event.dataTransfer.getData("text/plain") || draggedTaskId;
+                    if (draggedId) reorderTaskByDrop(draggedId, undefined, key);
                   }}
                 >
                   <div className="day-top">
@@ -1488,7 +1690,9 @@ export default function App() {
                     <span>Add a task</span>
                   </button>
  
-                  <div className="day-tasks">{dayTasks.map((task) => renderTask(task, true))}</div>
+                  <div className="day-tasks">
+                    {dayTasks.map((task) => renderTask(task, true))}
+                  </div>
                 </section>
               );
             })}
@@ -1823,11 +2027,32 @@ export default function App() {
         .day-add:hover { color: #19323B; }
         .day-add-symbol { font-size: 20px; color: #879E8C; }
         .day-tasks { display: flex; flex-direction: column; gap: 8px; min-height: 240px; }
+        .day-tasks .task-card { transition: transform .18s cubic-bezier(.2,.8,.2,1), opacity .16s ease, box-shadow .16s ease; }
+        .day-card, .day-card * { -webkit-user-select: none; user-select: none; }
+        .day-card { -webkit-touch-callout: none; }
+        .task-card.task-is-dragging {
+          opacity: 1 !important;
+          transform: none !important;
+          filter: none !important;
+          box-shadow: 0 5px 18px rgba(38,53,45,.10);
+          outline: 1px solid rgba(38,53,45,.12);
+        }
         .task-card {
           display: flex; align-items: flex-start; gap: 9px; padding: 11px 9px;
           border-radius: 10px; cursor: pointer; min-width: 0; transition: .18s;
         }
         .task-card:hover { transform: translateY(-1px); box-shadow: 0 4px 11px rgba(40,50,40,.07); }
+        .task-card { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+        .task-card.task-is-dragging {
+          opacity: 1 !important;
+          pointer-events: none;
+        }
+        .task-check { touch-action: manipulation; }
+        .task-header-save { display: inline-flex !important; visibility: visible !important; opacity: 1 !important; position: relative; z-index: 31; flex: 0 0 auto; white-space: nowrap; padding: 9px 14px; border-radius: 20px; font-size: 11px; }
+        .task-header-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex: 0 0 auto; min-width: max-content; position: relative; z-index: 32; }
+        .settings-logout-btn { display: inline-flex; align-items: center; gap: 10px; min-height: 42px; padding: 10px 14px; border: 1px solid #E7E5DC; border-radius: 12px; background: #FBFAF6; color: #48544B; font-size: 12px; cursor: pointer; }
+        .settings-logout-btn:hover { background: #F2F3EB; border-color: #C9D1C4; }
+        .settings-logout-icon { font-size: 18px; line-height: 1; }
         .task-card-compact { align-items: center; padding: 10px 9px; }
         .task-card-compact .task-title { font-size: 11px; }
         .task-card-compact .task-edit { display: none; }
@@ -2126,8 +2351,11 @@ export default function App() {
           to { opacity: 1; transform: translateY(0); }
         }
         .modal-header {
-          display: flex; align-items: center; justify-content: space-between;
-          margin-bottom: 27px;
+          position: sticky; top: 0; z-index: 50;
+          display: flex; align-items: center; justify-content: space-between; gap: 12px;
+          min-height: 68px; margin: -34px -36px 27px; padding: 14px 36px;
+          overflow: visible;
+          background: #FCFCED; border-bottom: 1px solid #EEEDE7;
         }
         .modal-kicker { color: #879199; font-size: 12px; font-weight: 600; letter-spacing: 2px; }
         .close-btn { width: 32px; height: 32px; border: 0; background: transparent; color: #747E80; font-size: 25px; }
@@ -2286,7 +2514,6 @@ export default function App() {
         .backup-import-label { position: relative; overflow: hidden; display: inline-flex; align-items: center; }
         .backup-import-label input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
         .task-mobile-edit { display: none; border: 0; padding: 5px 0 0; background: transparent; color: inherit; opacity: .65; font-size: 10px; text-align: left; }
-        .task-card { touch-action: pan-y; }
 
         @media (max-width: 1100px) {
           .week-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -2309,7 +2536,8 @@ export default function App() {
           .nav button { padding: 9px 12px; font-size: 11px; }
           .dashboard-strip { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; margin-top: 24px; padding-top: 4px; }
           .dashboard-card { min-height: 78px; padding: 10px 8px; }
-          .task-mobile-edit { display: inline-block; }
+          .task-mobile-edit { display: none; }
+          .task-header-save { min-height: 36px; }
           .backup-tools { align-items: flex-start; flex-direction: column; }
           .backup-actions { width: 100%; }
           .backup-actions > * { flex: 1; justify-content: center; }
@@ -2325,6 +2553,9 @@ export default function App() {
           .week-progress-copy { text-align: left; }
           .date-project-row { grid-template-columns: 1fr; gap: 0; }
           .modal { padding: 25px 20px; }
+          .modal-header {
+            top: 0; margin: -25px -20px 27px; padding: 15px 20px;
+          }
           .modal-footer { align-items: flex-start; }
           .detail-stats { grid-template-columns: 1fr 1fr; }
           .milestone-form { grid-template-columns: 1fr 1fr; }
@@ -2342,7 +2573,6 @@ export default function App() {
             <button className={page === "Projects" ? "active" : ""} onClick={() => setPage("Projects")}>Projects</button>
             <button className={page === "Settings" ? "active" : ""} onClick={() => setPage("Settings")}>Settings</button>
             <button className={`nav-search-btn ${searchOpen ? "active" : ""}`} onClick={() => { setSearchOpen((open) => !open); setSearchQuery(""); }} aria-label="Search" title="Search"><Icon name="search" size={17} /></button>
-            <button className="nav-search-btn" onClick={handleLogout} title="Sign out" aria-label="Sign out">↪</button>
           </nav>
           {searchOpen && <div className="global-search-wrap">
             <input autoFocus className="global-search" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search..." aria-label="Search tasks and projects" />
@@ -2486,6 +2716,14 @@ export default function App() {
               <label className="secondary-btn backup-import-label">Restore backup<input type="file" accept="application/json,.json" onChange={(event) => importBackup(event.target.files?.[0])} /></label>
             </div>
             {backupMessage && <small className="backup-message">{backupMessage}</small>}
+          </section>
+
+          <section className="settings-group settings-account-group">
+            <h2>Account</h2>
+            <button className="settings-logout-btn" type="button" onClick={handleLogout}>
+              <span className="settings-logout-icon" aria-hidden="true">↪</span>
+              <span>Log out</span>
+            </button>
           </section>
         </main>
       )}
@@ -2846,13 +3084,19 @@ export default function App() {
           <div className="modal" role="dialog" aria-modal="true">
             <div className="modal-header">
               <div className="modal-kicker">{editingTaskId ? "EDIT TASK" : "NEW TASK"}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                {editingTaskId && (
-                  <button className="delete-btn" onClick={deleteTask}>
-                    Delete
-                  </button>
-                )}
-                <button className="close-btn" aria-label="Close" onClick={closeTaskModal}><Icon name="close" size={17} /></button>
+              <div className="task-header-actions">
+                {editingTaskId && <button className="delete-btn" onClick={deleteTask}>Delete</button>}
+                <button
+                  type="button"
+                  className="primary-btn task-header-save"
+                  onClick={saveTask}
+                  disabled={!taskDraft.title.trim()}
+                >
+                  {editingTaskId ? "Save changes" : "Create a task"}
+                </button>
+                <button className="close-btn" aria-label="Close" onClick={closeTaskModal}>
+                  <Icon name="close" size={17} />
+                </button>
               </div>
             </div>
  

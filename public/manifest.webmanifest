@@ -1,0 +1,32 @@
+
+{
+  "name": "drømhjem",
+  "short_name": "drømhjem",
+  "description": "Less planning. More doing.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#FCFCED",
+  "theme_color": "#FCFCED",
+  "icons": [
+    {
+      "src": "/dromhjem-app-icon.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/dromhjem-app-icon.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/dromhjem_icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
+
