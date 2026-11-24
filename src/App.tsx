@@ -1018,28 +1018,6 @@ export default function App() {
     );
   };
  
-  const moveTask = (id: string, date: string) => {
-    const task = tasks.find((t) => t.id === id);
- 
-    if (!task || task.date === date) {
-      setDraggedTaskId(null);
-      return;
-    }
- 
-    if (!task.seriesId) {
-      setTasks((current) =>
-        current.map((t) => t.id === id
-          ? { ...t, date, ...(date ? {} : { unassignedColumnId: unassignedColumns[0]?.id || DEFAULT_UNASSIGNED_COLUMN_ID }) }
-          : t)
-      );
-      setDraggedTaskId(null);
-      return;
-    }
- 
-    setPendingMove({ taskId: id, newDate: date });
-    setDraggedTaskId(null);
-  };
- 
   const confirmMove = (moveAll: boolean) => {
     if (!pendingMove) return;
  
